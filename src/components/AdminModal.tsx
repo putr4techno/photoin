@@ -19,8 +19,11 @@ import {
   Shield,
   UserCheck,
   Check,
+  AlertCircle,
+  Copy,
+  Code,
+  Send,
 } from 'lucide-react';
-import { User } from 'firebase/auth';
 import { AdminRole, ColorThemeKey, CapturedPhoto, EventConfig, FrameTemplate } from '../types';
 import {
   DEFAULT_BANNER,
@@ -31,9 +34,16 @@ import {
   clearAllPhotos,
   updatePhoto,
 } from '../utils/storage';
-import { googleSignIn, logout, getAccessToken } from '../services/auth';
-import { getOrCreateVirtualMomentFolder, uploadPhotoToDrive } from '../services/drive';
+import { AuthError, AuthUser, googleSignIn, logout, getAccessToken } from '../services/auth';
+import {
+  APPS_SCRIPT_TEMPLATE,
+  getOrCreateVirtualMomentFolder,
+  uploadPhotoToDrive,
+  uploadPhotoViaAppsScript,
+  UploadResult,
+} from '../services/drive';
 import { THEMES, getTheme } from '../utils/theme';
+import firebaseConfig from '../../firebase-applet-config.json';
 
 interface AdminModalProps {
   isOpen: boolean;
@@ -42,8 +52,8 @@ interface AdminModalProps {
   frames: FrameTemplate[];
   onConfigChange: (newConfig: EventConfig) => void;
   onFramesChange: (newFrames: FrameTemplate[]) => void;
-  currentUser: User | null;
-  onAuthChange: (user: User | null) => void;
+  currentUser: AuthUser | null;
+  onAuthChange: (user: AuthUser | null) => void;
   adminRole: AdminRole;
 }
 
@@ -80,8 +90,25 @@ export const AdminModal: React.FC<AdminModalProps> = ({
   const [newUserPin, setNewUserPin] = useState('');
   const [userPinSuccess, setUserPinSuccess] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
+  const [driveAuthError, setDriveAuthError] = useState<{
+    message: string;
+    code: string;
+    hostname?: string;
+  } | null>(null);
+  const [copiedDomain, setCopiedDomain] = useState(false);
+  const [appsScriptTestResult, setAppsScriptTestResult] = useState<{
+    type: 'success' | 'error';
+    text: string;
+    url?: string;
+  } | null>(null);
+  const [isTestingScript, setIsTestingScript] = useState(false);
+  const [showScriptCode, setShowScriptCode] = useState(false);
+  const [copiedScript, setCopiedScript] = useState(false);
+  const [scriptUrlSaved, setScriptUrlSaved] = useState(false);
 
   const isSuperAdmin = adminRole === 'super';
+  const isAdminPinDefault = (config.adminPin || 'putrajamal') === 'putrajamal';
+  const isClientPinDefault = (config.clientPin || 'user123') === 'user123';
 
   // Theme
   const theme = getTheme(formData.themeColor);
@@ -302,6 +329,7 @@ export const AdminModal: React.FC<AdminModalProps> = ({
   const handleGoogleSignIn = async () => {
     setIsDriveConnecting(true);
     setDriveTestMessage(null);
+    setDriveAuthError(null);
     try {
       const res = await googleSignIn();
       if (res) {
@@ -316,7 +344,18 @@ export const AdminModal: React.FC<AdminModalProps> = ({
       }
     } catch (err: any) {
       console.error('Google Sign-In failed', err);
-      alert('Gagal menghubungkan Google Drive: ' + (err.message || 'Error otentikasi'));
+      const code = err instanceof AuthError ? err.code : err?.code || 'auth/unknown';
+      const hostname =
+        err instanceof AuthError && err.hostname
+          ? err.hostname
+          : typeof window !== 'undefined'
+          ? window.location.hostname
+          : '';
+      setDriveAuthError({
+        message: err?.message || 'Gagal menghubungkan Google Drive.',
+        code,
+        hostname,
+      });
     } finally {
       setIsDriveConnecting(false);
     }
@@ -331,6 +370,7 @@ export const AdminModal: React.FC<AdminModalProps> = ({
     onAuthChange(null);
     setDriveFolderLink(null);
     setDriveTestMessage(null);
+    setDriveAuthError(null);
   };
 
   // Test Folder Connection
@@ -356,24 +396,82 @@ export const AdminModal: React.FC<AdminModalProps> = ({
     }
   };
 
+  // Test Google Apps Script Web App Upload
+  const handleTestAppsScript = async () => {
+    const url = formData.appsScriptUrl?.trim() || '';
+    if (!url) {
+      setAppsScriptTestResult({
+        type: 'error',
+        text: 'Masukkan URL Web App Google Apps Script terlebih dahulu.',
+      });
+      return;
+    }
+
+    setIsTestingScript(true);
+    setAppsScriptTestResult(null);
+    try {
+      // Save URL first
+      const updatedConfig: EventConfig = {
+        ...formData,
+        driveUploadMethod: 'apps_script',
+        appsScriptUrl: url,
+      };
+      setFormData(updatedConfig);
+      onConfigChange(updatedConfig);
+      saveEventConfig(updatedConfig);
+
+      // Minimal 1x1 transparent PNG to test upload
+      const testPng =
+        'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
+      const result = await uploadPhotoViaAppsScript(
+        url,
+        `test_koneksi_${Date.now()}.png`,
+        testPng
+      );
+
+      setAppsScriptTestResult({
+        type: 'success',
+        text: 'Berhasil! File uji terkirim ke Google Drive melalui Apps Script.',
+        url: result.webViewLink,
+      });
+    } catch (err: any) {
+      setAppsScriptTestResult({
+        type: 'error',
+        text: err.message || 'Gagal menguji koneksi Google Apps Script.',
+      });
+    } finally {
+      setIsTestingScript(false);
+    }
+  };
+
   // Manual upload photo from gallery to Drive
   const handleManualUploadPhoto = async (photo: CapturedPhoto) => {
     try {
-      const token = await getAccessToken();
-      if (!token) {
-        alert('Silakan login Google Drive di tab Google Drive terlebih dahulu.');
-        return;
-      }
-
-      const folder = await getOrCreateVirtualMomentFolder(
-        token,
-        formData.driveFolderName || 'virtual moment'
-      );
       const cleanTitle = formData.title.replace(/[^a-zA-Z0-9]/g, '_');
       const timeStr = new Date(photo.timestamp).toISOString().replace(/[:.]/g, '-');
       const fileName = `Photobooth_${cleanTitle}_${timeStr}.png`;
 
-      const result = await uploadPhotoToDrive(token, folder.id, fileName, photo.dataUrl);
+      let result: UploadResult;
+
+      if (formData.driveUploadMethod === 'apps_script' && formData.appsScriptUrl?.trim()) {
+        result = await uploadPhotoViaAppsScript(
+          formData.appsScriptUrl.trim(),
+          fileName,
+          photo.dataUrl
+        );
+      } else {
+        const token = await getAccessToken();
+        if (!token) {
+          alert('Silakan hubungkan Google Drive (Apps Script atau Google Sign-In) terlebih dahulu.');
+          return;
+        }
+
+        const folder = await getOrCreateVirtualMomentFolder(
+          token,
+          formData.driveFolderName || 'virtual moment'
+        );
+        result = await uploadPhotoToDrive(token, folder.id, fileName, photo.dataUrl);
+      }
 
       const updated: CapturedPhoto = {
         ...photo,
@@ -455,9 +553,27 @@ export const AdminModal: React.FC<AdminModalProps> = ({
             </h3>
             <p className="text-xs text-slate-400 max-w-xs mb-6">
               {isSuperAdmin ? (
-                <>Akses panel Admin dilindungi oleh PIN keamanan (Default: <code className="text-amber-300 font-mono font-bold">putrajamal</code>)</>
+                <>
+                  Akses panel Admin dilindungi oleh PIN keamanan
+                  {isAdminPinDefault && (
+                    <>
+                      {' '}
+                      (Default: <code className="text-amber-300 font-mono font-bold">putrajamal</code>)
+                    </>
+                  )}
+                  .
+                </>
               ) : (
-                <>Akses panel User dilindungi oleh PIN keamanan (Default: <code className="text-blue-300 font-mono font-bold">{formData.clientPin || 'user123'}</code>)</>
+                <>
+                  Akses panel User dilindungi oleh PIN keamanan
+                  {isClientPinDefault && (
+                    <>
+                      {' '}
+                      (Default: <code className="text-blue-300 font-mono font-bold">user123</code>)
+                    </>
+                  )}
+                  .
+                </>
               )}
             </p>
 
@@ -478,7 +594,9 @@ export const AdminModal: React.FC<AdminModalProps> = ({
 
               {pinError && (
                 <p className="text-xs text-rose-400 font-medium">
-                  PIN salah. Silakan periksa kembali ({isSuperAdmin ? 'Default: putrajamal' : `Default: ${formData.clientPin || 'user123'}`})
+                  PIN salah. Silakan periksa kembali PIN {isSuperAdmin ? 'Admin' : 'User'} Anda
+                  {isSuperAdmin && isAdminPinDefault && ' (Default: putrajamal)'}
+                  {!isSuperAdmin && isClientPinDefault && ' (Default: user123)'}.
                 </p>
               )}
 
@@ -859,7 +977,11 @@ export const AdminModal: React.FC<AdminModalProps> = ({
                           </span>
                         </div>
                         <p className="text-[11px] text-slate-400 mb-3">
-                          Ganti PIN akses panel Admin utama Anda (Default: <code>putrajamal</code>).
+                          Ganti PIN akses panel Admin utama Anda
+                          {isAdminPinDefault ? (
+                            <> (Default: <code>putrajamal</code>)</>
+                          ) : null}
+                          .
                         </p>
                         <form onSubmit={handleChangePin} className="flex gap-2">
                           <input
@@ -992,146 +1114,389 @@ export const AdminModal: React.FC<AdminModalProps> = ({
                       Integrasi Google Drive
                     </h3>
                     <p className="text-xs text-slate-400">
-                      Otomatis tersimpan di folder <code className="text-amber-300 font-bold">“virtual moment”</code> dengan akses aman.
+                      Pilih metode penyimpanan otomatis foto tamu ke Google Drive Anda.
                     </p>
                   </div>
 
-                  {/* Connection Card */}
-                  <div className="p-5 rounded-2xl bg-slate-950 border border-slate-800 shadow-lg">
-                    {currentUser ? (
-                      /* Connected State */
-                      <div className="space-y-4">
-                        <div className="flex items-center justify-between">
-                          <div className="flex items-center gap-3">
-                            {currentUser.photoURL ? (
-                              <img
-                                src={currentUser.photoURL}
-                                alt="Avatar"
-                                className="w-12 h-12 rounded-full border border-amber-400/50"
-                              />
-                            ) : (
-                              <div className="w-12 h-12 rounded-full bg-amber-500/20 border border-amber-400/40 flex items-center justify-center text-amber-300 font-bold">
-                                {currentUser.email?.charAt(0).toUpperCase()}
-                              </div>
-                            )}
-                            <div>
-                              <div className="flex items-center gap-2">
-                                <h4 className="text-sm font-bold text-slate-100">
-                                  {currentUser.displayName || 'Pengguna Google'}
-                                </h4>
-                                <span className="text-[10px] bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 px-2 py-0.5 rounded-full font-semibold">
-                                  Terhubung
-                                </span>
-                              </div>
-                              <p className="text-xs text-slate-400">{currentUser.email}</p>
-                            </div>
-                          </div>
+                  {/* Mode Switcher */}
+                  <div className="grid grid-cols-2 gap-2 p-1 rounded-2xl bg-slate-950 border border-slate-800">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const updated: EventConfig = { ...formData, driveUploadMethod: 'apps_script' };
+                        setFormData(updated);
+                        onConfigChange(updated);
+                        saveEventConfig(updated);
+                      }}
+                      className={`py-2.5 px-3 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center justify-center gap-1.5 ${
+                        (formData.driveUploadMethod || 'apps_script') === 'apps_script'
+                          ? 'bg-amber-500 text-slate-950 shadow'
+                          : 'text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      <Code className="w-3.5 h-3.5" />
+                      <span>Apps Script (Tanpa Login)</span>
+                    </button>
 
-                          <button
-                            onClick={handleGoogleLogout}
-                            className="py-1.5 px-3 rounded-xl bg-slate-800 hover:bg-rose-500/20 hover:text-rose-300 text-slate-300 text-xs font-medium border border-slate-700 transition-colors cursor-pointer"
-                          >
-                            Keluar
-                          </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const updated: EventConfig = { ...formData, driveUploadMethod: 'oauth' };
+                        setFormData(updated);
+                        onConfigChange(updated);
+                        saveEventConfig(updated);
+                      }}
+                      className={`py-2.5 px-3 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center justify-center gap-1.5 ${
+                        formData.driveUploadMethod === 'oauth'
+                          ? 'bg-amber-500 text-slate-950 shadow'
+                          : 'text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      <Cloud className="w-3.5 h-3.5" />
+                      <span>Google Sign-In (OAuth)</span>
+                    </button>
+                  </div>
+
+                  {(formData.driveUploadMethod || 'apps_script') === 'apps_script' ? (
+                    /* MODE 1: GOOGLE APPS SCRIPT WEBHOOK */
+                    <div className="p-5 rounded-2xl bg-slate-950 border border-amber-500/30 shadow-lg space-y-4">
+                      <div>
+                        <div className="flex items-center justify-between mb-1">
+                          <h4 className="text-xs font-bold text-amber-300 uppercase tracking-wider">
+                            URL Web App Google Apps Script
+                          </h4>
+                          <span className="text-[10px] bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 px-2 py-0.5 rounded-full font-semibold">
+                            Bebas Error Domain
+                          </span>
                         </div>
+                        <p className="text-[11px] text-slate-400 mb-3">
+                          Tempelkan URL hasil deploy Web App dari Google Apps Script Anda. Foto tamu
+                          otomatis tersimpan ke folder Drive target & dibuat link publik untuk unduh.
+                        </p>
 
-                        {/* Folder Info */}
-                        <div className="p-3 rounded-xl bg-slate-900 border border-slate-800 flex items-center justify-between text-xs">
-                          <div>
-                            <span className="text-slate-400 block text-[10px] uppercase font-bold tracking-wider">
-                              Nama Folder Penyimpanan:
-                            </span>
-                            <span className="text-amber-300 font-bold">
-                              {formData.driveFolderName || 'virtual moment'}
-                            </span>
-                          </div>
+                        <div className="space-y-2.5">
+                          <input
+                            type="url"
+                            value={formData.appsScriptUrl || ''}
+                            onChange={(e) => {
+                              setFormData({ ...formData, appsScriptUrl: e.target.value });
+                              setScriptUrlSaved(false);
+                            }}
+                            placeholder="https://script.google.com/macros/s/.../exec"
+                            className="w-full py-2.5 px-3 rounded-xl bg-slate-900 border border-slate-700 text-slate-100 text-xs font-mono focus:outline-none focus:border-amber-400"
+                          />
 
-                          <div className="flex items-center gap-2">
+                          <div className="flex flex-wrap items-center gap-2">
                             <button
-                              onClick={handleTestDriveConnection}
-                              disabled={isDriveConnecting}
-                              className="py-1 px-2.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px] font-medium border border-slate-700 flex items-center gap-1 cursor-pointer"
+                              type="button"
+                              onClick={() => {
+                                const updated: EventConfig = {
+                                  ...formData,
+                                  driveUploadMethod: 'apps_script',
+                                  appsScriptUrl: (formData.appsScriptUrl || '').trim(),
+                                };
+                                setFormData(updated);
+                                onConfigChange(updated);
+                                saveEventConfig(updated);
+                                setScriptUrlSaved(true);
+                                setTimeout(() => setScriptUrlSaved(false), 2500);
+                              }}
+                              className="py-2 px-4 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs cursor-pointer transition-colors"
                             >
-                              <RefreshCw
-                                className={`w-3 h-3 ${isDriveConnecting ? 'animate-spin' : ''}`}
-                              />
-                              <span>Cek Folder</span>
+                              Simpan URL
                             </button>
 
-                            {driveFolderLink && (
+                            <button
+                              type="button"
+                              onClick={handleTestAppsScript}
+                              disabled={isTestingScript}
+                              className="py-2 px-4 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold text-xs border border-slate-700 flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                            >
+                              {isTestingScript ? (
+                                <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                              ) : (
+                                <Send className="w-3.5 h-3.5 text-amber-400" />
+                              )}
+                              <span>{isTestingScript ? 'Menguji...' : 'Tes Upload ke Drive'}</span>
+                            </button>
+
+                            {scriptUrlSaved && (
+                              <span className="text-xs text-emerald-400 font-semibold flex items-center gap-1">
+                                <CheckCircle2 className="w-3.5 h-3.5" /> Tersimpan
+                              </span>
+                            )}
+                          </div>
+                        </div>
+
+                        {appsScriptTestResult && (
+                          <div
+                            className={`mt-3 p-3 rounded-xl border text-xs flex items-center justify-between gap-2 ${
+                              appsScriptTestResult.type === 'success'
+                                ? 'bg-emerald-950/60 border-emerald-500/40 text-emerald-200'
+                                : 'bg-rose-950/60 border-rose-500/40 text-rose-200'
+                            }`}
+                          >
+                            <span>{appsScriptTestResult.text}</span>
+                            {appsScriptTestResult.url && (
                               <a
-                                href={driveFolderLink}
+                                href={appsScriptTestResult.url}
                                 target="_blank"
                                 rel="noreferrer"
-                                className="py-1 px-2.5 rounded-lg bg-amber-500/20 text-amber-300 hover:bg-amber-500/30 text-[11px] font-medium border border-amber-500/30 flex items-center gap-1"
+                                className="px-2.5 py-1 rounded bg-emerald-500/20 text-emerald-300 text-[10px] font-semibold border border-emerald-500/30 shrink-0 flex items-center gap-1"
                               >
-                                <span>Buka Folder</span>
+                                <span>Lihat</span>
                                 <ExternalLink className="w-3 h-3" />
                               </a>
                             )}
                           </div>
+                        )}
+                      </div>
+
+                      {/* Script Template Toggle */}
+                      <div className="pt-3 border-t border-slate-800">
+                        <div className="flex items-center justify-between">
+                          <button
+                            type="button"
+                            onClick={() => setShowScriptCode(!showScriptCode)}
+                            className="text-[11px] font-semibold text-amber-300 hover:underline flex items-center gap-1.5 cursor-pointer"
+                          >
+                            <Code className="w-3.5 h-3.5" />
+                            <span>
+                              {showScriptCode
+                                ? 'Sembunyikan Kode Google Apps Script'
+                                : 'Lihat / Salin Kode Google Apps Script (doPost)'}
+                            </span>
+                          </button>
+
+                          {showScriptCode && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                navigator.clipboard.writeText(APPS_SCRIPT_TEMPLATE);
+                                setCopiedScript(true);
+                                setTimeout(() => setCopiedScript(false), 2000);
+                              }}
+                              className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-[10px] font-semibold flex items-center gap-1 cursor-pointer"
+                            >
+                              <Copy className="w-3 h-3" />
+                              <span>{copiedScript ? 'Tersalin!' : 'Salin Kode'}</span>
+                            </button>
+                          )}
                         </div>
 
-                        {driveTestMessage && (
-                          <div className="p-2.5 rounded-xl bg-emerald-950/60 border border-emerald-500/30 text-emerald-300 text-xs">
-                            {driveTestMessage}
+                        {showScriptCode && (
+                          <div className="mt-2.5 space-y-2">
+                            <p className="text-[10px] text-slate-400">
+                              Deploy di <strong>script.google.com</strong> sebagai <strong>Web app</strong> → Execute as: <strong>Me</strong> → Who has access: <strong>Anyone</strong>.
+                            </p>
+                            <pre className="p-3 rounded-xl bg-slate-900 border border-slate-800 text-[10px] font-mono text-slate-300 overflow-x-auto max-h-48 leading-relaxed">
+                              {APPS_SCRIPT_TEMPLATE}
+                            </pre>
                           </div>
                         )}
                       </div>
-                    ) : (
-                      /* Disconnected State - Official Google Sign In Button */
-                      <div className="text-center py-4 flex flex-col items-center">
-                        <Cloud className="w-12 h-12 text-slate-600 mb-2" />
-                        <h4 className="text-sm font-bold text-slate-200 mb-1">
-                          Masuk dengan Akun Google
-                        </h4>
-                        <p className="text-xs text-slate-400 max-w-sm mb-5">
-                          Hubungkan Google Drive untuk menyimpan setiap hasil foto tamu secara instan
-                          ke folder <span className="text-amber-300">“virtual moment”</span>.
-                        </p>
-
-                        {/* Official Sign in with Google Button */}
-                        <button
-                          onClick={handleGoogleSignIn}
-                          disabled={isDriveConnecting}
-                          className="gsi-material-button shadow-lg hover:shadow-xl transition-shadow cursor-pointer disabled:opacity-50"
-                        >
-                          <div className="gsi-material-button-state"></div>
-                          <div className="gsi-material-button-content-wrapper">
-                            <div className="gsi-material-button-icon">
-                              <svg
-                                version="1.1"
-                                xmlns="http://www.w3.org/2000/svg"
-                                viewBox="0 0 48 48"
-                                style={{ display: 'block' }}
-                              >
-                                <path
-                                  fill="#EA4335"
-                                  d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"
+                    </div>
+                  ) : (
+                    /* MODE 2: OAUTH GOOGLE SIGN-IN */
+                    <div className="p-5 rounded-2xl bg-slate-950 border border-slate-800 shadow-lg">
+                      {currentUser ? (
+                        /* Connected State */
+                        <div className="space-y-4">
+                          <div className="flex items-center justify-between">
+                            <div className="flex items-center gap-3">
+                              {currentUser.photoURL ? (
+                                <img
+                                  src={currentUser.photoURL}
+                                  alt="Avatar"
+                                  className="w-12 h-12 rounded-full border border-amber-400/50"
                                 />
-                                <path
-                                  fill="#4285F4"
-                                  d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"
-                                />
-                                <path
-                                  fill="#FBBC05"
-                                  d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"
-                                />
-                                <path
-                                  fill="#34A853"
-                                  d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"
-                                />
-                                <path fill="none" d="M0 0h48v48H0z" />
-                              </svg>
+                              ) : (
+                                <div className="w-12 h-12 rounded-full bg-amber-500/20 border border-amber-400/40 flex items-center justify-center text-amber-300 font-bold">
+                                  {currentUser.email?.charAt(0).toUpperCase()}
+                                </div>
+                              )}
+                              <div>
+                                <div className="flex items-center gap-2">
+                                  <h4 className="text-sm font-bold text-slate-100">
+                                    {currentUser.displayName || 'Pengguna Google'}
+                                  </h4>
+                                  <span className="text-[10px] bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 px-2 py-0.5 rounded-full font-semibold">
+                                    Terhubung
+                                  </span>
+                                </div>
+                                <p className="text-xs text-slate-400">{currentUser.email}</p>
+                              </div>
                             </div>
-                            <span className="gsi-material-button-contents">
-                              {isDriveConnecting ? 'Menghubungkan...' : 'Sign in with Google'}
-                            </span>
+
+                            <button
+                              onClick={handleGoogleLogout}
+                              className="py-1.5 px-3 rounded-xl bg-slate-800 hover:bg-rose-500/20 hover:text-rose-300 text-slate-300 text-xs font-medium border border-slate-700 transition-colors cursor-pointer"
+                            >
+                              Keluar
+                            </button>
                           </div>
-                        </button>
-                      </div>
-                    )}
-                  </div>
+
+                          {/* Folder Info */}
+                          <div className="p-3 rounded-xl bg-slate-900 border border-slate-800 flex items-center justify-between text-xs">
+                            <div>
+                              <span className="text-slate-400 block text-[10px] uppercase font-bold tracking-wider">
+                                Nama Folder Penyimpanan:
+                              </span>
+                              <span className="text-amber-300 font-bold">
+                                {formData.driveFolderName || 'virtual moment'}
+                              </span>
+                            </div>
+
+                            <div className="flex items-center gap-2">
+                              <button
+                                onClick={handleTestDriveConnection}
+                                disabled={isDriveConnecting}
+                                className="py-1 px-2.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px] font-medium border border-slate-700 flex items-center gap-1 cursor-pointer"
+                              >
+                                <RefreshCw
+                                  className={`w-3 h-3 ${isDriveConnecting ? 'animate-spin' : ''}`}
+                                />
+                                <span>Cek Folder</span>
+                              </button>
+
+                              {driveFolderLink && (
+                                <a
+                                  href={driveFolderLink}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  className="py-1 px-2.5 rounded-lg bg-amber-500/20 text-amber-300 hover:bg-amber-500/30 text-[11px] font-medium border border-amber-500/30 flex items-center gap-1"
+                                >
+                                  <span>Buka Folder</span>
+                                  <ExternalLink className="w-3 h-3" />
+                                </a>
+                              )}
+                            </div>
+                          </div>
+
+                          {driveTestMessage && (
+                            <div className="p-2.5 rounded-xl bg-emerald-950/60 border border-emerald-500/30 text-emerald-300 text-xs">
+                              {driveTestMessage}
+                            </div>
+                          )}
+                        </div>
+                      ) : (
+                        /* Disconnected State - Official Google Sign In Button */
+                        <div className="text-center py-4 flex flex-col items-center">
+                          <Cloud className="w-12 h-12 text-slate-600 mb-2" />
+                          <h4 className="text-sm font-bold text-slate-200 mb-1">
+                            Masuk dengan Akun Google
+                          </h4>
+                          <p className="text-xs text-slate-400 max-w-sm mb-5">
+                            Hubungkan Google Drive untuk menyimpan setiap hasil foto tamu secara instan
+                            ke folder <span className="text-amber-300">“virtual moment”</span>.
+                          </p>
+
+                          {/* Official Sign in with Google Button */}
+                          <button
+                            onClick={handleGoogleSignIn}
+                            disabled={isDriveConnecting}
+                            className="gsi-material-button shadow-lg hover:shadow-xl transition-shadow cursor-pointer disabled:opacity-50"
+                          >
+                            <div className="gsi-material-button-state"></div>
+                            <div className="gsi-material-button-content-wrapper">
+                              <div className="gsi-material-button-icon">
+                                <svg
+                                  version="1.1"
+                                  xmlns="http://www.w3.org/2000/svg"
+                                  viewBox="0 0 48 48"
+                                  style={{ display: 'block' }}
+                                >
+                                  <path
+                                    fill="#EA4335"
+                                    d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"
+                                  />
+                                  <path
+                                    fill="#4285F4"
+                                    d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"
+                                  />
+                                  <path
+                                    fill="#FBBC05"
+                                    d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"
+                                  />
+                                  <path
+                                    fill="#34A853"
+                                    d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"
+                                  />
+                                  <path fill="none" d="M0 0h48v48H0z" />
+                                </svg>
+                              </div>
+                              <span className="gsi-material-button-contents">
+                                {isDriveConnecting ? 'Menghubungkan...' : 'Sign in with Google'}
+                              </span>
+                            </div>
+                          </button>
+
+                          {driveAuthError && (
+                            <div className="mt-4 w-full text-left p-3.5 rounded-xl bg-rose-950/60 border border-rose-500/40 text-xs text-rose-200 space-y-2">
+                              <div className="flex items-start gap-2">
+                                <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                                <div>
+                                  <p className="font-bold text-rose-300">
+                                    Gagal Menghubungkan Google Drive
+                                  </p>
+                                  <p className="text-[11px] text-rose-200/90 mt-0.5">
+                                    {driveAuthError.code === 'auth/unauthorized-domain'
+                                      ? 'Domain aplikasi saat ini belum terdaftar di Authorized Domains Firebase / Google OAuth.'
+                                      : driveAuthError.message}
+                                  </p>
+                                </div>
+                              </div>
+
+                              {driveAuthError.code === 'auth/unauthorized-domain' && driveAuthError.hostname && (
+                                <div className="bg-slate-950/80 border border-rose-500/20 rounded-lg p-2.5 space-y-2">
+                                  <div className="flex items-center justify-between gap-2">
+                                    <code className="text-[11px] text-amber-300 font-mono break-all">
+                                      {driveAuthError.hostname}
+                                    </code>
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        navigator.clipboard.writeText(driveAuthError.hostname || '');
+                                        setCopiedDomain(true);
+                                        setTimeout(() => setCopiedDomain(false), 2000);
+                                      }}
+                                      className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 text-[10px] font-semibold flex items-center gap-1 shrink-0 cursor-pointer"
+                                    >
+                                      <Copy className="w-3 h-3" />
+                                      <span>{copiedDomain ? 'Tersalin' : 'Salin Domain'}</span>
+                                    </button>
+                                  </div>
+                                  <p className="text-[10px] text-slate-400 leading-relaxed">
+                                    Salin domain di atas dan tambahkan ke <strong>Authorized domains</strong> di Firebase Authentication, atau gunakan tab <strong>Apps Script (Tanpa Login)</strong> di atas.
+                                  </p>
+                                  <div className="flex flex-wrap gap-2">
+                                    <a
+                                      href={`https://console.firebase.google.com/project/${firebaseConfig.projectId}/authentication/settings`}
+                                      target="_blank"
+                                      rel="noreferrer"
+                                      className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 text-[10px] font-semibold border border-amber-500/30"
+                                    >
+                                      <span>Firebase Authorized Domains</span>
+                                      <ExternalLink className="w-3 h-3" />
+                                    </a>
+                                    <a
+                                      href={`https://console.cloud.google.com/apis/credentials?project=${firebaseConfig.projectId}`}
+                                      target="_blank"
+                                      rel="noreferrer"
+                                      className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-200 text-[10px] font-semibold border border-slate-700"
+                                    >
+                                      <span>Google Cloud OAuth</span>
+                                      <ExternalLink className="w-3 h-3" />
+                                    </a>
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )}
 
                   {/* Automatic Sync Option */}
                   <div className="p-4 rounded-2xl bg-slate-950/60 border border-slate-800 flex items-center justify-between gap-4">
@@ -1242,15 +1607,18 @@ export const AdminModal: React.FC<AdminModalProps> = ({
                               </a>
 
                               {/* Upload to Drive if not uploaded */}
-                              {photo.driveUploadStatus !== 'success' && currentUser && (
-                                <button
-                                  onClick={() => handleManualUploadPhoto(photo)}
-                                  className="p-1 rounded bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 text-[10px] cursor-pointer"
-                                  title="Upload ke Drive"
-                                >
-                                  <Cloud className="w-3 h-3" />
-                                </button>
-                              )}
+                              {photo.driveUploadStatus !== 'success' &&
+                                ((formData.driveUploadMethod === 'apps_script' &&
+                                  Boolean(formData.appsScriptUrl?.trim())) ||
+                                  currentUser) && (
+                                  <button
+                                    onClick={() => handleManualUploadPhoto(photo)}
+                                    className="p-1 rounded bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 text-[10px] cursor-pointer"
+                                    title="Upload ke Drive"
+                                  >
+                                    <Cloud className="w-3 h-3" />
+                                  </button>
+                                )}
 
                               {/* Drive link if uploaded */}
                               {photo.driveWebViewLink && (

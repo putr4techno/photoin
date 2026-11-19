@@ -1,5 +1,4 @@
 import React, { useState, useEffect } from 'react';
-import { User } from 'firebase/auth';
 import { AdminRole, CapturedPhoto, EventConfig, FrameTemplate, ScreenState } from './types';
 import {
   loadEventConfig,
@@ -8,7 +7,7 @@ import {
   saveEventConfig,
   saveFrameTemplates,
 } from './utils/storage';
-import { initAuth } from './services/auth';
+import { AuthUser, initAuth } from './services/auth';
 import { Header } from './components/Header';
 import { WelcomeScreen } from './components/WelcomeScreen';
 import { FrameSelectionScreen } from './components/FrameSelectionScreen';
@@ -28,7 +27,7 @@ export default function App() {
   const [capturedPhoto, setCapturedPhoto] = useState<CapturedPhoto | null>(null);
   const [isAdminOpen, setIsAdminOpen] = useState(false);
   const [adminRole, setAdminRole] = useState<AdminRole>('client');
-  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [currentUser, setCurrentUser] = useState<AuthUser | null>(null);
 
   // Initialize Firebase Auth listener
   useEffect(() => {

@@ -16,7 +16,12 @@ import {
 } from 'lucide-react';
 import { CapturedPhoto, EventConfig } from '../types';
 import { getAccessToken } from '../services/auth';
-import { getOrCreateVirtualMomentFolder, uploadPhotoToDrive } from '../services/drive';
+import {
+  getOrCreateVirtualMomentFolder,
+  uploadPhotoToDrive,
+  uploadPhotoViaAppsScript,
+  UploadResult,
+} from '../services/drive';
 import { updatePhoto } from '../utils/storage';
 import { getTheme } from '../utils/theme';
 
@@ -61,25 +66,45 @@ export const ResultScreen: React.FC<ResultScreenProps> = ({
   const handleAutoUpload = async () => {
     if (!config.autoUploadDrive) return;
 
+    const useAppsScript = config.driveUploadMethod === 'apps_script';
+
     try {
-      const token = await getAccessToken();
-      if (!token) {
-        // Not logged in to Google Drive yet
-        return;
-      }
-
-      setDriveStatus('uploading');
-      setDriveError(null);
-
-      // 1. Ensure folder "virtual moment" exists
-      const folder = await getOrCreateVirtualMomentFolder(token, config.driveFolderName || 'virtual moment');
-
-      // 2. Upload photo
       const cleanTitle = config.title.replace(/[^a-zA-Z0-9]/g, '_');
       const timeStr = new Date(currentPhoto.timestamp).toISOString().replace(/[:.]/g, '-');
       const fileName = `Photobooth_${cleanTitle}_${timeStr}.png`;
 
-      const result = await uploadPhotoToDrive(token, folder.id, fileName, currentPhoto.dataUrl);
+      let result: UploadResult;
+
+      if (useAppsScript) {
+        if (!config.appsScriptUrl?.trim()) {
+          return;
+        }
+        setDriveStatus('uploading');
+        setDriveError(null);
+        result = await uploadPhotoViaAppsScript(
+          config.appsScriptUrl.trim(),
+          fileName,
+          currentPhoto.dataUrl
+        );
+      } else {
+        const token = await getAccessToken();
+        if (!token) {
+          // Not logged in to Google Drive yet
+          return;
+        }
+
+        setDriveStatus('uploading');
+        setDriveError(null);
+
+        // 1. Ensure folder "virtual moment" exists
+        const folder = await getOrCreateVirtualMomentFolder(
+          token,
+          config.driveFolderName || 'virtual moment'
+        );
+
+        // 2. Upload photo
+        result = await uploadPhotoToDrive(token, folder.id, fileName, currentPhoto.dataUrl);
+      }
 
       setDriveStatus('success');
       setDriveUrl(result.webViewLink);
@@ -242,13 +267,17 @@ export const ResultScreen: React.FC<ResultScreenProps> = ({
             <div className="bg-slate-900/60 border border-slate-800 rounded-xl p-2.5 px-3 flex items-center justify-between text-slate-400 text-xs">
               <div className="flex items-center gap-2 text-[11px]">
                 <Cloud className="w-4 h-4 text-slate-500" />
-                <span>Google Drive belum terhubung</span>
+                <span>
+                  {config.driveUploadMethod === 'apps_script'
+                    ? 'URL Apps Script Drive belum diatur'
+                    : 'Google Drive belum terhubung'}
+                </span>
               </div>
               <button
                 onClick={onOpenAdmin}
                 className="text-amber-400 text-[11px] hover:underline font-medium"
               >
-                Hubungkan di Admin
+                Atur di Panel
               </button>
             </div>
           )}
@@ -322,6 +351,29 @@ export const ResultScreen: React.FC<ResultScreenProps> = ({
                 Unduh file PNG langsung ke galeri perangkat Anda untuk diunggah ke Instagram Story
                 atau dibagikan ke WhatsApp.
               </p>
+              {driveUrl && (
+                <div className="mb-3 p-2.5 rounded-xl bg-slate-950 border border-slate-800 text-left space-y-2">
+                  <p className="text-[10px] text-emerald-300 font-semibold">
+                    Tautan Google Drive Siap Dibagikan:
+                  </p>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="text"
+                      readOnly
+                      value={driveUrl}
+                      className="flex-1 text-[10px] font-mono bg-slate-900 border border-slate-800 rounded px-2 py-1 text-slate-300"
+                    />
+                    <a
+                      href={driveUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="px-2.5 py-1 rounded bg-emerald-500/20 text-emerald-300 text-[10px] font-semibold border border-emerald-500/30 shrink-0"
+                    >
+                      Buka
+                    </a>
+                  </div>
+                </div>
+              )}
               <button
                 onClick={handleDownload}
                 className="w-full py-2.5 rounded-xl bg-amber-500 text-slate-950 font-bold text-sm shadow-md"

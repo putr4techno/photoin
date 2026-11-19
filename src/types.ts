@@ -12,6 +12,8 @@ export interface EventConfig {
   adminPin: string;
   clientPin: string;
   autoUploadDrive: boolean;
+  driveUploadMethod: 'oauth' | 'apps_script';
+  appsScriptUrl?: string;
   driveFolderId?: string;
   driveFolderName: string;
 }

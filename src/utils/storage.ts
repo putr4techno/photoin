@@ -70,6 +70,8 @@ export const DEFAULT_CONFIG: EventConfig = {
   adminPin: 'putrajamal',
   clientPin: 'user123',
   autoUploadDrive: true,
+  driveUploadMethod: 'apps_script',
+  appsScriptUrl: '',
   driveFolderName: 'virtual moment',
 };
 
