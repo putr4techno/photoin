@@ -1,0 +1,6 @@
+{
+  "name": "Virtual Photobooth",
+  "description": "Aplikasi Virtual Photobooth interaktif dengan template frame custom, digital invitation welcome banner, dan integrasi Google Drive.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
